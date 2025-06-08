@@ -18,10 +18,14 @@ type Redis struct {
 	walFile *os.File
 	lock    sync.RWMutex
 	walLock sync.Mutex
+
+	subscribers map[string][]net.Conn
+	subLock     sync.RWMutex
 }
 
 func (c *Redis) NewRedisServer() {
 	c.db = make(map[string][]string)
+	c.subscribers = make(map[string][]net.Conn)
 
 	var err error
 	c.walFile, err = os.OpenFile("data.wal", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -58,6 +62,19 @@ func (c *Redis) del(key string) {
 	delete(c.db, key)
 }
 
+func (c *Redis) publish(topic, message string) {
+	c.subLock.RLock()
+	subs := c.subscribers[topic]
+	c.subLock.RUnlock()
+
+	for _, conn := range subs {
+		_, err := conn.Write([]byte(fmt.Sprintf("[PUB][%s] %s\n", topic, message)))
+		if err != nil {
+			log.Printf("Failed to send message to subscriber: %s", err)
+		}
+	}
+}
+
 func (c *Redis) Operation(cmd RedisCommand, walEnabled bool) (string, error) {
 	writeCommands := []string{"SET", "HMSET", "DEL"}
 	if walEnabled && slices.Contains(writeCommands, cmd.command) {
@@ -75,6 +92,14 @@ func (c *Redis) Operation(cmd RedisCommand, walEnabled bool) (string, error) {
 	case "DEL":
 		c.del(cmd.key)
 		return "OK", nil
+	case "SUBSCRIBE":
+		c.subLock.Lock()
+		c.subscribers[cmd.key] = append(c.subscribers[cmd.key], cmd.conn)
+		c.subLock.Unlock()
+		return fmt.Sprintf("Subscribed to %s", cmd.key), nil
+	case "PUBLISH":
+		go c.publish(cmd.key, strings.Join(cmd.value, " "))
+		return fmt.Sprintf("Message published to %s", cmd.key), nil
 	}
 	return "", fmt.Errorf("invalid Command")
 }
@@ -165,6 +190,7 @@ type RedisCommand struct {
 	command string
 	key     string
 	value   []string
+	conn    net.Conn
 }
 
 func (cmd *RedisCommand) parse(query string) (err error) {
@@ -241,6 +267,7 @@ func handleConn(conn net.Conn, c *Redis) {
 		}
 
 		cmd := RedisCommand{}
+		cmd.conn = conn
 		if err := cmd.parse(input); err != nil {
 			conn.Write([]byte("Invalid command\n"))
 			continue
@@ -265,7 +292,7 @@ func main() {
 			cache.saveSnapshot()
 			// Save snapshot every 10 seconds
 			// Adjust the duration as needed
-			time.Sleep(10 * time.Second)
+			time.Sleep(20 * time.Second)
 		}
 	}()
 
