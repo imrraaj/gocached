@@ -30,6 +30,25 @@ func (c *Redis) del(key string) {
 	delete(c.db, key)
 }
 
+func (c *Redis) Operation(cmd RedisCommand) (string, error) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	switch cmd.command {
+	case "PING":
+		return "PONG", nil
+	case "GET":
+		val := c.get(cmd.key)
+		return strings.Join(val, " "), nil
+	case "SET", "HMSET":
+		c.set(cmd.key, cmd.value)
+		return "OK", nil
+	case "DEL":
+		c.del(cmd.key)
+		return "OK", nil
+	}
+	return "", fmt.Errorf("invalid Command")
+}
+
 type RedisCommand struct {
 	command string
 	key     string
@@ -96,19 +115,12 @@ func handleConn(conn net.Conn, c *Redis) {
 		conn.Write([]byte("Invalid command\n"))
 		return
 	}
-
-	switch cmd.command {
-	case "PING":
-		conn.Write([]byte("PONG\n"))
-	case "GET":
-		val := c.get(cmd.key)
-		conn.Write([]byte(strings.Join(val, " ") + "\n"))
-	case "SET", "HMSET":
-		c.set(cmd.key, cmd.value)
-		conn.Write([]byte("OK\n"))
-	case "DEL":
-		c.del(cmd.key)
-		conn.Write([]byte("OK\n"))
+	if val, err := c.Operation(cmd); err == nil {
+		conn.Write([]byte(val + "\n"))
+		return
+	} else {
+		conn.Write([]byte("Invalid command\n"))
+		return
 	}
 }
 
