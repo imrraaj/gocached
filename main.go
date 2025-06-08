@@ -14,11 +14,10 @@ import (
 )
 
 type Redis struct {
-	db      map[string][]string
-	walFile *os.File
-	lock    sync.RWMutex
-	walLock sync.Mutex
-
+	db          map[string][]string
+	walFile     *os.File
+	lock        sync.RWMutex
+	walLock     sync.Mutex
 	subscribers map[string][]net.Conn
 	subLock     sync.RWMutex
 }
@@ -32,16 +31,13 @@ func (c *Redis) NewRedisServer() {
 	if err != nil {
 		log.Fatalf("Could not open WAL file: %s", err)
 	}
-
-	log.Printf("WAL file opened successfully: %s", c.walFile.Name())
 	c.loadSnapshot()
 }
+
 func (c *Redis) Close() {
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	if err := c.walFile.Close(); err != nil {
-		log.Printf("Could not close WAL file: %s", err)
-	}
+	c.walFile.Close()
 	c.saveSnapshot()
 }
 
@@ -50,12 +46,13 @@ func (c *Redis) set(key string, value []string) {
 	defer c.lock.Unlock()
 	c.db[key] = value
 }
+
 func (c *Redis) get(key string) []string {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	val := c.db[key]
-	return val
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	return c.db[key]
 }
+
 func (c *Redis) del(key string) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
@@ -68,9 +65,8 @@ func (c *Redis) publish(topic, message string) {
 	c.subLock.RUnlock()
 
 	for _, conn := range subs {
-		_, err := conn.Write([]byte(fmt.Sprintf("[PUB][%s] %s\n", topic, message)))
-		if err != nil {
-			log.Printf("Failed to send message to subscriber: %s", err)
+		if _, err := conn.Write([]byte(fmt.Sprintf("[PUB][%s] %s\n", topic, message))); err != nil {
+			log.Printf("Publish error: %s", err)
 		}
 	}
 }
@@ -80,12 +76,12 @@ func (c *Redis) Operation(cmd RedisCommand, walEnabled bool) (string, error) {
 	if walEnabled && slices.Contains(writeCommands, cmd.command) {
 		c.appendToWAL(cmd)
 	}
+
 	switch cmd.command {
 	case "PING":
 		return "PONG", nil
 	case "GET":
-		val := c.get(cmd.key)
-		return strings.Join(val, " "), nil
+		return strings.Join(c.get(cmd.key), " "), nil
 	case "SET", "HMSET":
 		c.set(cmd.key, cmd.value)
 		return "OK", nil
@@ -100,23 +96,25 @@ func (c *Redis) Operation(cmd RedisCommand, walEnabled bool) (string, error) {
 	case "PUBLISH":
 		go c.publish(cmd.key, strings.Join(cmd.value, " "))
 		return fmt.Sprintf("Message published to %s", cmd.key), nil
+	default:
+		return "", fmt.Errorf("invalid Command")
 	}
-	return "", fmt.Errorf("invalid Command")
 }
 
 func (c *Redis) appendToWAL(cmd RedisCommand) {
 	c.walLock.Lock()
 	defer c.walLock.Unlock()
-	entry := cmd.command + " " + cmd.key + " " + strings.Join(cmd.value, " ") + "\n"
+	entry := fmt.Sprintf("%s %s %s\n", cmd.command, cmd.key, strings.Join(cmd.value, " "))
 	c.walFile.WriteString(entry)
 }
+
 func (c *Redis) saveSnapshot() {
 	c.lock.RLock()
 	defer c.lock.RUnlock()
 
 	tempFile, err := os.OpenFile("data.dat", os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		log.Printf("Failed to create temp snapshot file: %s", err)
+		log.Printf("Snapshot creation error: %s", err)
 		return
 	}
 	defer tempFile.Close()
@@ -127,31 +125,22 @@ func (c *Redis) saveSnapshot() {
 		return
 	}
 
-	// Replace the old file
 	if err := os.Rename(tempFile.Name(), "data.dat"); err != nil {
-		log.Printf("Failed to replace snapshot file: %s", err)
-		return
+		log.Printf("Snapshot replace error: %s", err)
 	}
 
-	// Clear WAL
 	c.walLock.Lock()
 	defer c.walLock.Unlock()
-	if err := c.walFile.Truncate(0); err != nil {
-		log.Printf("Could not truncate WAL file: %s", err)
-	}
-	if _, err := c.walFile.Seek(0, 0); err != nil {
-		log.Printf("Could not seek to start of WAL file: %s", err)
-	}
-	if err := c.walFile.Sync(); err != nil {
-		log.Printf("Could not sync WAL file: %s", err)
-	}
-
-	log.Println("Snapshot saved and WAL truncated.")
+	c.walFile.Truncate(0)
+	c.walFile.Seek(0, 0)
+	c.walFile.Sync()
+	log.Println("Snapshot saved and WAL cleared")
 }
+
 func (c *Redis) loadSnapshot() {
 	file, err := os.Open("data.dat")
 	if err != nil {
-		log.Printf("Could not open snapshot file: %s", err)
+		log.Printf("Snapshot open error: %s", err)
 		return
 	}
 	defer file.Close()
@@ -160,7 +149,6 @@ func (c *Redis) loadSnapshot() {
 	defer c.lock.Unlock()
 
 	c.db = make(map[string][]string)
-
 	decoder := gob.NewDecoder(file)
 	if err := decoder.Decode(&c.db); err != nil {
 		log.Printf("Snapshot decode error: %s", err)
@@ -193,57 +181,41 @@ type RedisCommand struct {
 	conn    net.Conn
 }
 
-func (cmd *RedisCommand) parse(query string) (err error) {
+func (cmd *RedisCommand) parse(query string) error {
 	query = strings.ReplaceAll(query, "\r\n", " ")
 	query = strings.ReplaceAll(query, "\n", " ")
-	command := strings.Fields(query)
-
-	if len(command) < 1 {
+	args := strings.Fields(query)
+	if len(args) < 1 {
 		return fmt.Errorf("empty command")
 	}
 
-	cmd.command = strings.ToUpper(command[0])
+	cmd.command = strings.ToUpper(args[0])
 	switch cmd.command {
 	case "PING":
-		{
-			return nil
+		return nil
+	case "GET", "DEL", "SUBSCRIBE":
+		if len(args) < 2 {
+			return fmt.Errorf("missing key")
 		}
-	case "GET", "DEL":
-		if len(command) < 2 {
-			err := fmt.Errorf("invalid command")
-			return err
-		}
-		cmd.key = command[1]
+		cmd.key = args[1]
 	case "SET":
-		{
-			if len(command) < 3 {
-				err = fmt.Errorf("invalid command")
-				return
-			}
-			cmd.key = command[1]
-			cmd.value = []string{command[2]}
+		if len(args) < 3 {
+			return fmt.Errorf("missing value")
 		}
+		cmd.key = args[1]
+		cmd.value = []string{args[2]}
 	case "HMSET":
-		{
-			if len(command) < 2 {
-				err = fmt.Errorf("invalid command")
-				return
-			}
-			cmd.key = command[1]
-			cmd.value = command[2:]
+		if len(args) < 3 {
+			return fmt.Errorf("missing values")
 		}
-	case "SUBSCRIBE":
-		if len(command) < 2 {
-			return fmt.Errorf("invalid SUBSCRIBE command")
-		}
-		cmd.key = command[1]
+		cmd.key = args[1]
+		cmd.value = args[2:]
 	case "PUBLISH":
-		if len(command) < 3 {
-			return fmt.Errorf("invalid PUBLISH command")
+		if len(args) < 3 {
+			return fmt.Errorf("missing message")
 		}
-		cmd.key = command[1]
-		cmd.value = command[2:]
-
+		cmd.key = args[1]
+		cmd.value = args[2:]
 	default:
 		return fmt.Errorf("unknown command: %s", cmd.command)
 	}
@@ -252,32 +224,30 @@ func (cmd *RedisCommand) parse(query string) (err error) {
 
 func handleConn(conn net.Conn, c *Redis) {
 	defer conn.Close()
-
 	buf := make([]byte, 1024)
+
 	for {
 		n, err := conn.Read(buf)
 		if err != nil {
-			log.Printf("Connection closed or error: %s\n", err)
+			log.Printf("Connection error: %s", err)
 			return
 		}
-
 		input := strings.TrimSpace(string(buf[:n]))
 		if input == "" {
 			continue
 		}
 
-		cmd := RedisCommand{}
-		cmd.conn = conn
+		cmd := RedisCommand{conn: conn}
 		if err := cmd.parse(input); err != nil {
 			conn.Write([]byte("Invalid command\n"))
 			continue
 		}
 
-		val, err := c.Operation(cmd, true)
+		resp, err := c.Operation(cmd, true)
 		if err != nil {
 			conn.Write([]byte("Invalid command\n"))
 		} else {
-			conn.Write([]byte(val + "\n"))
+			conn.Write([]byte(resp + "\n"))
 		}
 	}
 }
@@ -289,10 +259,8 @@ func main() {
 
 	go func() {
 		for {
-			cache.saveSnapshot()
-			// Save snapshot every 10 seconds
-			// Adjust the duration as needed
 			time.Sleep(20 * time.Second)
+			cache.saveSnapshot()
 		}
 	}()
 
