@@ -5,20 +5,28 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync"
 )
 
 type Redis struct {
-	db map[string][]string
+	db   map[string][]string
+	lock sync.RWMutex
 }
 
 func (c *Redis) set(key string, value []string) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
 	c.db[key] = value
 }
 func (c *Redis) get(key string) []string {
+	c.lock.Lock()
+	defer c.lock.Unlock()
 	val := c.db[key]
 	return val
 }
 func (c *Redis) del(key string) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
 	delete(c.db, key)
 }
 
@@ -29,31 +37,26 @@ type RedisCommand struct {
 }
 
 func (cmd *RedisCommand) parse(query string) (err error) {
+	query = strings.ReplaceAll(query, "\r\n", " ")
+	query = strings.ReplaceAll(query, "\n", " ")
+	command := strings.Fields(query)
 
-	query = strings.Replace(query, "\r\n", " ", -1)
-	query = strings.Replace(query, "\n", " ", -1)
-	queryArray := strings.Split(query, " ")
-
-	var command []string
-	for _, v := range queryArray {
-		if v != "" {
-			command = append(command, v)
-		}
+	if len(command) < 1 {
+		return fmt.Errorf("empty command")
 	}
-	cmd.command = command[0]
+
+	cmd.command = strings.ToUpper(command[0])
 	switch cmd.command {
 	case "PING":
 		{
 			return nil
 		}
-	case "GET":
-		{
-			if len(command) < 2 {
-				err := fmt.Errorf("invalid command")
-				return err
-			}
-			cmd.key = command[1]
+	case "GET", "DEL":
+		if len(command) < 2 {
+			err := fmt.Errorf("invalid command")
+			return err
 		}
+		cmd.key = command[1]
 	case "SET":
 		{
 			if len(command) < 3 {
@@ -61,15 +64,7 @@ func (cmd *RedisCommand) parse(query string) (err error) {
 				return
 			}
 			cmd.key = command[1]
-			cmd.value = append(cmd.value, command[2])
-		}
-	case "DEL":
-		{
-			if len(command) < 2 {
-				err = fmt.Errorf("invalid command")
-				return
-			}
-			cmd.key = command[1]
+			cmd.value = []string{command[2]}
 		}
 	case "HMSET":
 		{
@@ -78,13 +73,10 @@ func (cmd *RedisCommand) parse(query string) (err error) {
 				return
 			}
 			cmd.key = command[1]
-			cmd.value = append(cmd.value, command[2:]...)
+			cmd.value = command[2:]
 		}
 	default:
-		{
-			err = fmt.Errorf("invalid command")
-			return err
-		}
+		return fmt.Errorf("unknown command: %s", cmd.command)
 	}
 	return nil
 }
@@ -92,47 +84,31 @@ func (cmd *RedisCommand) parse(query string) (err error) {
 func handleConn(conn net.Conn, c *Redis) {
 	defer conn.Close()
 
-	buffer := make([]byte, 64)
-	_, err := conn.Read(buffer)
-
+	buffer := make([]byte, 1024)
+	n, err := conn.Read(buffer)
 	if err != nil {
-		log.Printf("error reading from connection: %s\n", err)
+		log.Printf("error reading: %s\n", err)
 		return
 	}
 
-	buff := string(buffer)
 	cmd := RedisCommand{}
-	err = cmd.parse(buff)
-	if err != nil {
+	if err := cmd.parse(string(buffer[:n])); err != nil {
 		conn.Write([]byte("Invalid command\n"))
 		return
 	}
 
 	switch cmd.command {
 	case "PING":
-		{
-			conn.Write([]byte("PONG\n"))
-		}
+		conn.Write([]byte("PONG\n"))
 	case "GET":
-		{
-			val := c.get(cmd.key)
-			conn.Write([]byte(strings.Join(val, " ")))
-		}
-	case "SET":
-		{
-			c.set(cmd.key, cmd.value)
-			conn.Write([]byte("OK"))
-		}
+		val := c.get(cmd.key)
+		conn.Write([]byte(strings.Join(val, " ") + "\n"))
+	case "SET", "HMSET":
+		c.set(cmd.key, cmd.value)
+		conn.Write([]byte("OK\n"))
 	case "DEL":
-		{
-			c.del(cmd.key)
-			conn.Write([]byte("OK"))
-		}
-	case "HMSET":
-		{
-			c.set(cmd.key, cmd.value)
-			conn.Write([]byte("OK"))
-		}
+		c.del(cmd.key)
+		conn.Write([]byte("OK\n"))
 	}
 }
 
