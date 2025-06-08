@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/gob"
+	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -14,20 +15,24 @@ import (
 )
 
 type Redis struct {
-	db          map[string][]string
-	walFile     *os.File
-	lock        sync.RWMutex
-	walLock     sync.Mutex
-	subscribers map[string][]net.Conn
-	subLock     sync.RWMutex
+	db           map[string][]string
+	walFileName  string
+	dataFileName string
+	walFile      *os.File
+	lock         sync.RWMutex
+	walLock      sync.Mutex
+	subscribers  map[string][]net.Conn
+	subLock      sync.RWMutex
 }
 
-func (c *Redis) NewRedisServer() {
+func (c *Redis) NewRedisServer(walPath, dataPath string) {
 	c.db = make(map[string][]string)
 	c.subscribers = make(map[string][]net.Conn)
+	c.walFileName = walPath
+	c.dataFileName = dataPath
 
 	var err error
-	c.walFile, err = os.OpenFile("data.wal", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	c.walFile, err = os.OpenFile(c.walFileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		log.Fatalf("Could not open WAL file: %s", err)
 	}
@@ -138,7 +143,7 @@ func (c *Redis) saveSnapshot() {
 }
 
 func (c *Redis) loadSnapshot() {
-	file, err := os.Open("data.dat")
+	file, err := os.Open(c.dataFileName)
 	if err != nil {
 		log.Printf("Snapshot open error: %s", err)
 		return
@@ -253,28 +258,36 @@ func handleConn(conn net.Conn, c *Redis) {
 }
 
 func main() {
+	walFileName := flag.String("wal", "data.wal", "Path to WAL file")
+	dataFileName := flag.String("data", "data.dat", "Path to snapshot data file")
+	port := flag.Int("port", 6969, "TCP port to listen on")
+	snapshotInterval := flag.Int("interval", 60, "Snapshot interval in seconds")
+
+	flag.Parse()
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
 	var cache Redis
-	cache.NewRedisServer()
+	cache.NewRedisServer(*walFileName, *dataFileName)
 	defer cache.Close()
 
 	go func() {
 		for {
-			time.Sleep(20 * time.Second)
 			cache.saveSnapshot()
+			time.Sleep(time.Duration(*snapshotInterval) * time.Second)
 		}
 	}()
 
-	Port := 6969
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", Port))
+	addr := fmt.Sprintf(":%d", *port)
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		log.Fatalf("Could not initialize the server: %s", err)
+		log.Fatalf("Could not initialize the server on port %d: %s", *port, err)
 	}
+	log.Printf("Listening on port %d...\n", *port)
 
-	log.Printf("Listening on port %d...\n", Port)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Println("Could not accept the connection")
+			log.Println("Could not accept the connection:", err)
 			continue
 		}
 		go handleConn(conn, &cache)
